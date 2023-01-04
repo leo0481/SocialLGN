@@ -28,19 +28,16 @@ class PairDataset:
     def __init__(self, src="lastfm"):
         self.src = src
         try:
-            self.trainSet = pd.read_csv(f'./data/{src}/output/trainSet.txt')
-            self.valSet = pd.read_csv(f'./data/{src}/output/valSet.txt')
-            self.testSet = pd.read_csv(f'./data/{src}/output/testSet.txt')
-
+            self.train_set = pd.read_csv(f'./data/preprocessed/{src}/train_set.txt')
+            self.test_set = pd.read_csv(f'./data/preprocessed/{src}/test_set.txt')
+            self.n_user = pd.concat([self.train_set, self.test_set])['user'].nunique()
+            self.m_item = pd.concat([self.train_set, self.test_set])['item'].nunique()
         except IOError:
             self.interactionNet, self.n_user, self.m_item = loadInteraction(src)
-            self.trainSet, self.valSet, self.testSet = splitDataset(self.interactionNet)
+            self.train_set, self.test_set = splitDataset(self.interactionNet)
+            self.train_set.to_csv(f'./data/preprocessed/{src}/train_set.txt', index=False)
+            self.test_set.to_csv(f'./data/preprocessed/{src}/test_set.txt', index=False)
 
-        self.train_set = pd.read_csv(f'./data/preprocessed/{src}/train_set.txt')
-        self.test_set = pd.read_csv(f'./data/preprocessed/{src}/test_set.txt')
-
-        self.n_user = pd.concat([self.train_set, self.test_set])['user'].nunique()
-        self.m_item = pd.concat([self.train_set, self.test_set])['item'].nunique()
         self.trainUser = np.array(self.train_set['user'])
         self.trainUniqueUser = np.unique(self.train_set['user'])
         self.trainItem = np.array(self.train_set['item'])
@@ -128,17 +125,13 @@ class PairDataset:
         return test_data
 
     def __build_cold_test(self):
-        test_data = {}
-        for i in range(len(self.test_set)):
-            user = self.test_set['user'][i]
-            item = self.test_set['item'][i]
-            if test_data.get(user):
-                test_data[user].append(item)
-            else:
-                test_data[user] = [item]
+        test_data = self._testDic.copy()
         for i in list(test_data.keys()):
-            if self.train_set['user'].value_counts()[i] > 20:
-                del test_data[i]
+            try:
+                if self.train_set['user'].value_counts()[i] > 20:
+                    del test_data[i]
+            except:
+                pass
         return test_data
 
     def _getInteractionDic(self):
@@ -172,7 +165,7 @@ class GraphDataset(PairDataset):
     def getInteractionGraph(self):
         if self.interactionGraph is None:
             try:
-                norm_adj = sp.load_npz(f'./data/{self.src}/output/interaction_adj_mat.npz')
+                norm_adj = sp.load_npz(f'./data/preprocessed/{self.src}/interaction_adj_mat.npz')
                 logging.debug("successfully loaded normalized interaction adjacency matrix")
             except IOError:
                 logging.debug("generating adjacency matrix")
@@ -192,10 +185,10 @@ class GraphDataset(PairDataset):
                 norm_adj = d_mat.dot(adj_mat)
                 norm_adj = norm_adj.dot(d_mat)
                 norm_adj = norm_adj.tocsr()
-                sp.save_npz(f'./data/{self.src}/output/interaction_adj_mat.npz', norm_adj)
+                sp.save_npz(f'./data/preprocessed/{self.src}/interaction_adj_mat.npz', norm_adj)
                 logging.debug(f"costing {time() - start}s, saved normalized interaction adjacency matrix")
 
-            self.interactionGraph = self._convert_sp_mat_to_sp_tensor(norm_adj)
+            self.interactionGraph = _convert_sp_mat_to_sp_tensor(norm_adj)
             self.interactionGraph = self.interactionGraph.coalesce().to(world.device)
         return self.interactionGraph
 
@@ -203,7 +196,7 @@ class GraphDataset(PairDataset):
 class SocialGraphDataset(GraphDataset):
     def __init__(self, src):
         super(SocialGraphDataset, self).__init__(src)
-        trustPath = f'./data/{src}/output/trust.txt'
+        trustPath = f'./data/preprocessed/{src}/trust.txt'
         if os.path.exists(trustPath):
             self.friendNet = pd.read_csv(trustPath)
         else:
@@ -268,99 +261,13 @@ def loadInteraction(src='lastfm', prepro='origin', binary=True, posThreshold=Non
         """
     df = pd.DataFrame()
     # which dataset will use
-    if src == 'ml-100k':
-        df = pd.read_csv(f'./data/{src}/u.data', sep='\t', header=None,
-                         names=['user', 'item', 'rating', 'timestamp'], engine='python')
-
-    elif src == 'ml-1m':
-        df = pd.read_csv(f'./data/{src}/ratings.dat', sep='::', header=None,
-                         names=['user', 'item', 'rating', 'timestamp'], engine='python')
-        # only consider rating >=4 for data density
-        # df = df.query('rating >= 4').reset_index(drop=True).copy()
-
-    elif src == 'ml-10m':
-        df = pd.read_csv(f'./data/{src}/ratings.dat', sep='::', header=None,
-                         names=['user', 'item', 'rating', 'timestamp'], engine='python')
-        # df = df.query('rating >= 4').reset_index(drop=True).copy()
-
-    elif src == 'ml-20m':
-        df = pd.read_csv(f'./data/{src}/ratings.csv')
-        df.rename(columns={'userId': 'user', 'movieId': 'item'}, inplace=True)
-        # df = df.query('rating >= 4').reset_index(drop=True)
-
-    elif src == 'netflix':
-        cnt = 0
-        tmp_file = open(f'./data/{src}/training_data.csv', 'w')
-        tmp_file.write('user,item,rating,timestamp' + '\n')
-        for f in os.listdir(f'./data/{src}/training_set/'):
-            cnt += 1
-            if cnt % 5000 == 0:
-                print(f'Finish Process {cnt} file......')
-            txt_file = open(f'./data/{src}/training_set/{f}', 'r')
-            contents = txt_file.readlines()
-            item = contents[0].strip().split(':')[0]
-            for val in contents[1:]:
-                user, rating, timestamp = val.strip().split(',')
-                tmp_file.write(','.join([user, item, rating, timestamp]) + '\n')
-            txt_file.close()
-
-        tmp_file.close()
-
-        df = pd.read_csv(f'./data/{src}/training_data.csv')
-        df['rating'] = df.rating.astype(float)
-        df['timestamp'] = pd.to_datetime(df['timestamp'])
-
-    elif src == 'bx':
-        df = pd.read_csv(f'./data/{src}/BX-Book-Ratings.csv', delimiter=";", encoding="latin1")
-        df.rename(columns={'User-ID': 'user', 'ISBN': 'item', 'Book-Rating': 'rating'}, inplace=True)
-
-    elif src == 'amazon-cloth':
-        df = pd.read_csv(f'./data/{src}/ratings_Clothing_Shoes_and_Jewelry.csv',
-                         names=['user', 'item', 'rating', 'timestamp'])
-
-    elif src == 'amazon-electronic':
-        df = pd.read_csv(f'./data/{src}/ratings_Electronics.csv',
-                         names=['user', 'item', 'rating', 'timestamp'])
-
-    elif src == 'amazon-book':
-        df = pd.read_csv(f'./data/{src}/ratings_Books.csv',
-                         names=['user', 'item', 'rating', 'timestamp'], low_memory=False)
-        df = df[df['timestamp'].str.isnumeric()].copy()
-        df['timestamp'] = df['timestamp'].astype(int)
-
-    elif src == 'amazon-music':
-        df = pd.read_csv(f'./data/{src}/ratings_Digital_Music.csv',
-                         names=['user', 'item', 'rating', 'timestamp'])
-
-    elif src == 'citeulike':
-        user = 0
-        dt = []
-        for line in open(f'./data/{src}/users.dat', 'r'):
-            val = line.split()
-            for item in val:
-                dt.append([user, item])
-            user += 1
-        df = pd.DataFrame(dt, columns=['user', 'item'])
-        # fake timestamp column
-        df['timestamp'] = 1
-
-    elif src == 'lastfm':
+    if src == 'lastfm':
         # user_artists.dat
-        df = pd.read_csv(f'./data/{src}/user_artists.dat', sep='\t')
+        df = pd.read_csv(f'./data/raw/{src}/user_artists.dat', sep='\t')
         df.rename(columns={'userID': 'user', 'artistID': 'item', 'weight': 'rating'}, inplace=True)
 
-    elif src == 'epinions':
-        d = sio.loadmat(f'./data/{src}/rating_with_timestamp.mat')
-        prime = []
-        for val in d['rating_with_timestamp']:
-            user, item, rating, timestamp = val[0], val[1], val[3], val[5]
-            prime.append([user, item, rating, timestamp])
-        df = pd.DataFrame(prime, columns=['user', 'item', 'rating', 'timestamp'])
-        del prime, d, user
-        gc.collect()
-
     elif src == 'ciao':
-        d = sio.loadmat(f'./data/{src}/rating_with_timestamp.mat')
+        d = sio.loadmat(f'./data/raw/{src}/rating_with_timestamp.mat')
         prime = []
         for val in d['rating']:
             user, item, rating, timestamp = val[0], val[1], val[3], val[5]
@@ -368,16 +275,6 @@ def loadInteraction(src='lastfm', prepro='origin', binary=True, posThreshold=Non
         df = pd.DataFrame(prime, columns=['user', 'item', 'rating', 'timestamp'])
         del prime, d, user, item, rating, timestamp
         gc.collect()
-
-    elif src == 'gowalla':
-        df = pd.read_csv(f'./data/{src}/Gowalla_totalCheckins.txt', sep='\t',
-                         names=['user', 'timestamp', 'latitude', 'longitude', 'item'])
-        df['rating'] = 1.0
-        df = df[['user', 'item', 'rating', 'timestamp']]
-
-    elif src in ['douban', 'yelp']:
-        df = pd.read_csv(f'./data/{src}/ratings.txt', sep=' ', names=['user', 'item', 'rating'])
-
     else:
         raise ValueError('Invalid Dataset Error')
 
@@ -469,12 +366,12 @@ def loadInteraction(src='lastfm', prepro='origin', binary=True, posThreshold=Non
     userCodeDict = {int(value): code for code, value in enumerate(userId.categories.values)}
     itemCodeDict = {int(value): code for code, value in enumerate(itemId.categories.values)}
 
-    outputPath = f"./data/{src}/output"
+    outputPath = f"./data/preprocessed/{src}"
     if not os.path.exists(outputPath):
         os.makedirs(outputPath)
-    with open(f"./data/{src}/output/userReindex.json", "w") as f:
+    with open(f"./data/preprocessed/{src}/userReindex.json", "w") as f:
         f.write(json.dumps(userCodeDict))
-    with open(f"./data/{src}/output/itemReindex.json", "w") as f:
+    with open(f"./data/preprocessed/{src}/itemReindex.json", "w") as f:
         f.write(json.dumps(itemCodeDict))
 
     userNum = df['user'].nunique()
@@ -485,26 +382,16 @@ def loadInteraction(src='lastfm', prepro='origin', binary=True, posThreshold=Non
 
 
 def loadFriend(src):
-    path = f'./data/{src}/output/trust.txt'
+    path = f'./data/preprocessed/{src}/trust.txt'
     if os.path.exists(path):
         return pd.read_csv(path)
 
     if src == 'lastfm':
-        friendNet = pd.read_csv(f'./data/{src}/user_friends.dat', sep='\t')
+        friendNet = pd.read_csv(f'./data/raw/{src}/user_friends.dat', sep='\t')
         friendNet.rename(columns={'userID': 'user', 'friendID': 'friend'}, inplace=True)
 
-    elif src == 'epinions':
-        d = sio.loadmat(f'./data/{src}/trust.mat')
-        prime = []
-        for val in d['trust']:
-            user, friend = val[0], val[1]
-            prime.append([user, friend])
-        friendNet = pd.DataFrame(prime, columns=['user', 'friend'])
-        del prime, d, user, friend, val
-        gc.collect()
-
     elif src == 'ciao':
-        d = sio.loadmat(f'./data/{src}/trust.mat')
+        d = sio.loadmat(f'./data/raw/{src}/trust.mat')
         prime = []
         for val in d['trust']:
             user, friend = val[0], val[1]
@@ -512,14 +399,6 @@ def loadFriend(src):
         friendNet = pd.DataFrame(prime, columns=['user', 'friend'])
         del prime, d, user, friend, val
         gc.collect()
-
-    elif src == 'gowalla':
-        friendNet = pd.read_csv(f'./data/{src}/Gowalla_edges.txt', names=['user', 'friend'], sep='\t')
-
-    elif src in ['douban', 'yelp']:
-        friendNet = pd.read_csv(f'./data/{src}/trusts.txt', names=['user', 'friend', 'rating'], sep=' ')
-        friendNet.drop(['rating'], axis=1, inplace=True)
-
     else:
         raise ValueError('Invalid Dataset Error')
 
@@ -533,7 +412,7 @@ def loadFriend(src):
 
 
 def renameFriendID(src: str, friendNet: pd.DataFrame):
-    with open(f"./data/{src}/output/userReindex.json") as f:
+    with open(f"./data/preprocessed/{src}/userReindex.json") as f:
         userReindex = json.load(f)
     friendNet['user'] = friendNet.apply(lambda x: reIndex(x.user, userReindex), axis=1)
     friendNet['friend'] = friendNet.apply(lambda x: reIndex(x.friend, userReindex), axis=1)
@@ -550,6 +429,7 @@ def reIndex(x, userReindex):
 
 def splitDataset(df, testMethod='fo', testSize=.2):
     """
+    this is from https://github.com/recsys-benchmark/DaisyRec-v2.0
     method of splitting data into training data and test data
     Parameters
     ----------
@@ -570,10 +450,8 @@ def splitDataset(df, testMethod='fo', testSize=.2):
     test_set : pd.DataFrame test dataset
 
     """
-    # 只修改了fo模式，改成训练集验证集和测试集
 
     train_set, test_set = pd.DataFrame(), pd.DataFrame()
-    val_set = None
     if testMethod == 'ufo':
         driver_ids = df['user']
         _, driver_indices = np.unique(np.array(driver_ids), return_inverse=True)
@@ -602,8 +480,7 @@ def splitDataset(df, testMethod='fo', testSize=.2):
         train_set, test_set = df.iloc[:split_idx, :].copy(), df.iloc[split_idx:, :].copy()
 
     elif testMethod == 'fo':
-        other_set, test_set = train_test_split(df, test_size=testSize, random_state=2020)
-        train_set, val_set = train_test_split(other_set, test_size=0.125, random_state=2020)
+        train_set, test_set = train_test_split(df, test_size=testSize, random_state=2020)
 
     elif testMethod == 'tloo':
         # df = df.sample(frac=1)
@@ -627,7 +504,5 @@ def splitDataset(df, testMethod='fo', testSize=.2):
         raise ValueError('Invalid data_split value, expect: loo, fo, tloo, tfo')
 
     train_set, test_set = train_set.reset_index(drop=True), test_set.reset_index(drop=True)
-    if val_set is not None:
-        val_set = val_set.reset_index(drop=True)
 
-    return train_set, val_set, test_set
+    return train_set, test_set
